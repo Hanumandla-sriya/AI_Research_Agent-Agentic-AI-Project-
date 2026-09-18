@@ -1,0 +1,9 @@
+langgraph
+langchain-openai
+langchain-core
+pydantic
+httpx
+python-dotenv
+gradio
+ddgs
+tavily-python
