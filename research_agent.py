@@ -360,6 +360,27 @@ def _failure_hint() -> str:
             "or increase LLM_MIN_INTERVAL.")
 
 
+def _is_transient(e: Exception) -> bool:
+    """Temporary provider problems (overloaded / unavailable) that are worth retrying."""
+    s_ = str(e)
+    return ("503" in s_ or "UNAVAILABLE" in s_ or "overloaded" in s_.lower()
+            or "high demand" in s_.lower() or "temporarily" in s_.lower())
+
+
+def _retry_transient(fn, tries: int = 4):
+    """Run fn(); on a temporary provider error wait and retry with a growing delay."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            if _is_transient(e) and attempt < tries - 1:
+                wait = 10 * (attempt + 1)
+                print(f"  [LLM] Model busy (attempt {attempt + 1}/{tries}); retrying in {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+
+
 def call_llm_structured(
     llm: ChatOpenAI,
     system_prompt: str,
@@ -371,9 +392,13 @@ def call_llm_structured(
 
     # Attempt 1: function calling is the most widely supported structured mode.
     try:
-        _throttle()
         structured_llm = llm.with_structured_output(output_model, method="function_calling")
-        result = structured_llm.invoke(messages)
+
+        def _call():
+            _throttle()
+            return structured_llm.invoke(messages)
+
+        result = _retry_transient(_call)
         if result is not None:
             return result
         raise ValueError("model returned no structured result")
@@ -390,11 +415,14 @@ def call_llm_structured(
             "\n\nIMPORTANT: Respond with ONLY a valid JSON object (no prose, no code fences) "
             f"matching this schema:\n{json.dumps(schema, indent=2)}"
         )
-        _throttle()
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt + json_instruction),
-        ])
+        def _call_json():
+            _throttle()
+            return llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt + json_instruction),
+            ])
+
+        response = _retry_transient(_call_json)
         content = response.content if hasattr(response, "content") else str(response)
         raw = _extract_json(content)
         if raw:
@@ -413,11 +441,14 @@ def call_llm_structured(
 def call_llm_text(llm: ChatOpenAI, system_prompt: str, user_prompt: str) -> str:
     """Call LLM and return raw text."""
     try:
-        _throttle()
-        response = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ])
+        def _call_text():
+            _throttle()
+            return llm.invoke([
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=user_prompt),
+            ])
+
+        response = _retry_transient(_call_text)
         return response.content if hasattr(response, "content") else str(response)
     except Exception as e:
         if _is_quota_error(e):
