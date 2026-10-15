@@ -13,7 +13,7 @@ def run_research_stream(query, max_iter):
     """Generator function to stream agent steps and final answer to the UI."""
     graph = build_research_graph()
     thread_id = f"ui_thread_{int(time.time())}"
-    config = {"configurable": {"thread_id": thread_id}}
+    config = {"configurable": {"thread_id": thread_id}, "recursion_limit": 150}
     
     initial_state = {
         "query": query,
