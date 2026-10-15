@@ -25,4 +25,4 @@ COPY research_agent.py app.py ./
 EXPOSE 7860
 
 # Command to run the application
-CMD ["python", "app.py"]
+CMD ["sh", "-c", "export GRADIO_SERVER_PORT=${PORT:-7860}; exec python app.py"]
