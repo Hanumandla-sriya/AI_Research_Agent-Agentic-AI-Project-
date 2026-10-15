@@ -5,9 +5,10 @@ A stateful, multi-step research agent that decomposes queries,
 searches the web, extracts evidence, reflects on sufficiency,
 and synthesizes cited answers.
 
-Requirements:
-    - OPENROUTER_API_KEY environment variable
-    - Tavily API key (TAVILY_API_KEY) OR ddgs package for DuckDuckGo
+Environment variables:
+    OPENROUTER_API_KEY   (required)
+    OPENROUTER_MODEL     (recommended; copy an exact slug from openrouter.ai/models)
+    TAVILY_API_KEY       (optional; DuckDuckGo is used if missing or if Tavily fails)
 """
 
 import os
@@ -16,7 +17,7 @@ import time
 import json
 import operator
 from typing import TypedDict, List, Optional, Literal, Annotated, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 
 import httpx
@@ -32,27 +33,41 @@ from langgraph.checkpoint.memory import MemorySaver
 # 1. CONFIGURATION
 # ============================================================
 
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet")
-TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+def _env(name: str, default: str = "") -> str:
+    """Read an env var and strip whitespace/quotes (common copy-paste problem)."""
+    return os.environ.get(name, default).strip().strip('"').strip("'")
 
-MAX_ITERATIONS = 3
-MAX_SEARCH_RESULTS = 5
+
+OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# Set OPENROUTER_MODEL in your environment. Old slugs (e.g. anthropic/claude-3.5-sonnet)
+# can return "404 No endpoints found", so copy a current slug from openrouter.ai/models.
+DEFAULT_MODEL = _env("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+TAVILY_API_KEY = _env("TAVILY_API_KEY")
+
+MAX_ITERATIONS = 3          # research rounds (1 = single pass, no gap-filling loop)
+MAX_SUBQUESTIONS = 5        # cap on the initial plan size
+MAX_GAP_QUESTIONS = 3       # cap on new sub-questions per reflection round
+MAX_SEARCH_RESULTS = 6
 MAX_PAGES_PER_SUBQUESTION = 3
-MAX_PAGE_TOKENS = 6000  # character budget per page
+MAX_PAGE_TOKENS = 6000      # character budget per page
+MIN_RELEVANCE = 0.4         # drop evidence below this relevance
+MAX_EVIDENCE_FOR_SYNTHESIS = 40
+RECURSION_LIMIT = 150       # LangGraph default (25) is too low for multi-sub-question runs
 
 
 def create_llm(temperature: float = 0.1, max_tokens: int = 4000):
     """Create an LLM instance connected to OpenRouter."""
     if not OPENROUTER_API_KEY:
-        raise ValueError("Set OPENROUTER_API_KEY environment variable.")
+        raise ValueError("Set the OPENROUTER_API_KEY environment variable.")
     return ChatOpenAI(
         model=DEFAULT_MODEL,
         openai_api_base=OPENROUTER_BASE_URL,
         openai_api_key=OPENROUTER_API_KEY,
         temperature=temperature,
         max_tokens=max_tokens,
+        timeout=90,
+        max_retries=2,
     )
 
 
@@ -72,12 +87,13 @@ class SubQuestion(BaseModel):
     id: str = Field(description="Unique identifier, e.g., 'sq1'")
     text: str = Field(description="The sub-question text")
     search_strategy: str = Field(
+        default="general",
         description="Search strategy: 'general', 'news', 'academic', or 'domain'"
     )
-    expected_evidence: str = Field(description="What type of evidence is expected")
+    expected_evidence: str = Field(default="", description="What type of evidence is expected")
     dependencies: List[str] = Field(
         default_factory=list,
-        description="IDs of sub-questions that must be answered first"
+        description="IDs of sub-questions that must be answered first (usually empty)"
     )
     status: SubQuestionStatus = Field(default=SubQuestionStatus.PENDING)
 
@@ -87,19 +103,19 @@ class ResearchPlan(BaseModel):
     sub_questions: List[SubQuestion] = Field(
         description="Ordered list of sub-questions to research"
     )
-    reasoning: str = Field(description="Why this decomposition was chosen")
+    reasoning: str = Field(default="", description="Why this decomposition was chosen")
 
 
 class EvidenceItem(BaseModel):
     """A single piece of extracted evidence."""
     claim: str = Field(description="The factual claim or finding")
-    source_url: str = Field(description="URL of the source")
+    source_url: str = Field(default="", description="URL of the source")
     source_title: str = Field(default="", description="Title of the source page")
-    snippet: str = Field(description="Exact quote or close paraphrase from source")
-    relevance: float = Field(ge=0.0, le=1.0, description="Relevance score 0-1")
-    credibility: float = Field(ge=0.0, le=1.0, description="Credibility score 0-1")
-    sub_question_id: str = Field(description="Which sub-question this evidence addresses")
-    retrieved_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    snippet: str = Field(default="", description="Exact quote or close paraphrase from source")
+    relevance: float = Field(default=0.5, description="Relevance score 0-1")
+    credibility: float = Field(default=0.5, description="Credibility score 0-1")
+    sub_question_id: str = Field(default="", description="Which sub-question this evidence addresses")
+    retrieved_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
 class ExtractedEvidence(BaseModel):
@@ -114,12 +130,12 @@ class ExtractedEvidence(BaseModel):
 class ReflectionResult(BaseModel):
     """Structured output from the reflection node."""
     is_sufficient: bool = Field(description="Whether evidence is sufficient to answer the query")
-    confidence: float = Field(ge=0.0, le=1.0, description="Confidence in current evidence")
+    confidence: float = Field(default=0.5, description="Confidence in current evidence, 0-1")
     gaps: List[str] = Field(
         default_factory=list,
         description="Specific gaps as new sub-question texts (empty if sufficient)"
     )
-    reasoning: str = Field(description="Explanation of the assessment")
+    reasoning: str = Field(default="", description="Explanation of the assessment")
     new_sub_questions: List[SubQuestion] = Field(
         default_factory=list,
         description="New sub-questions to add to the plan (empty if sufficient)"
@@ -127,7 +143,7 @@ class ReflectionResult(BaseModel):
 
 
 class FinalAnswer(BaseModel):
-    """Structured final answer with citations."""
+    """Final answer with citations."""
     answer: str = Field(description="Comprehensive answer to the user's query")
     citations: List[Dict[str, str]] = Field(
         default_factory=list,
@@ -145,7 +161,7 @@ class FinalAnswer(BaseModel):
 # 3. STATE DEFINITION
 # ============================================================
 
-class ResearchState(TypedDict):
+class ResearchState(TypedDict, total=False):
     """Shared state across all nodes in the research graph."""
     query: str
     plan: List[SubQuestion]
@@ -154,6 +170,7 @@ class ResearchState(TypedDict):
     gaps: List[str]
     raw_search_results: List[Dict[str, Any]]
     fetched_pages: List[Dict[str, str]]
+    seen_urls: Annotated[List[str], operator.add]
     iteration: int
     max_iterations: int
     status: Literal["planning", "searching", "reflecting", "done", "error"]
@@ -169,46 +186,48 @@ class ResearchState(TypedDict):
 class SearchProvider:
     """Base interface for search providers."""
 
-    def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS) -> List[Dict[str, Any]]:
+    def search(
+        self, query: str, max_results: int = MAX_SEARCH_RESULTS, strategy: str = "general"
+    ) -> List[Dict[str, Any]]:
         raise NotImplementedError
 
 
 class TavilySearchProvider(SearchProvider):
-    """Search provider using Tavily API, optimized for news and recent content."""
+    """Search provider using the Tavily API."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.endpoint = "https://api.tavily.com/search"
 
-    def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS, strategy: str = "general") -> List[Dict[str, Any]]:
-        headers = {"Content-Type": "application/json"}
-        
-        # Use Tavily's News endpoint if the planner asked for news
-        topic = "news" if strategy == "news" else "general"
-        
+    def search(
+        self, query: str, max_results: int = MAX_SEARCH_RESULTS, strategy: str = "general"
+    ) -> List[Dict[str, Any]]:
+        headers = {
+            "Content-Type": "application/json",
+            # Current Tavily API expects Bearer auth; the body key is kept for older API versions.
+            "Authorization": f"Bearer {self.api_key}",
+        }
         payload = {
             "api_key": self.api_key,
             "query": query,
             "max_results": max_results,
-            "topic": topic,
+            "topic": "news" if strategy == "news" else "general",
             "include_answer": False,
-            # Optional: you can uncomment the line below to only get results from the last 7 days
-            # "days": 7, 
         }
         try:
-            with httpx.Client(timeout=15.0) as client:
+            with httpx.Client(timeout=20.0) as client:
                 resp = client.post(self.endpoint, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
-                results = []
-                for r in data.get("results", []):
-                    results.append({
-                        "url": r.get("url", ""),
-                        "title": r.get("title", ""),
-                        "snippet": r.get("content", ""),
-                        "source_type": "web",
-                    })
-                return results
+            return [
+                {
+                    "url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "snippet": r.get("content", ""),
+                    "source_type": "web",
+                }
+                for r in data.get("results", [])
+            ]
         except Exception as e:
             print(f"  [Tavily] Search error: {e}")
             return []
@@ -217,8 +236,9 @@ class TavilySearchProvider(SearchProvider):
 class DuckDuckGoSearchProvider(SearchProvider):
     """Search provider using DuckDuckGo (no API key needed)."""
 
-    # FIX: Added 'strategy: str = "general"' to accept the argument from search_node
-    def search(self, query: str, max_results: int = MAX_SEARCH_RESULTS, strategy: str = "general") -> List[Dict[str, Any]]:
+    def search(
+        self, query: str, max_results: int = MAX_SEARCH_RESULTS, strategy: str = "general"
+    ) -> List[Dict[str, Any]]:
         try:
             from ddgs import DDGS
         except ImportError:
@@ -228,32 +248,40 @@ class DuckDuckGoSearchProvider(SearchProvider):
                 print("  [DuckDuckGo] Package not installed. Install with: pip install ddgs")
                 return []
 
-        try:
-            results = []
+        def _run(kind: str) -> List[Dict[str, Any]]:
+            out = []
             with DDGS() as ddgs:
-                # Note: DuckDuckGo text search doesn't have a strict news filter like Tavily,
-                # so we accept the strategy argument but use standard text search.
-                for r in ddgs.text(query, max_results=max_results):
-                    results.append({
-                        "url": r.get("href", r.get("url", "")),
+                fn = ddgs.news if kind == "news" else ddgs.text
+                for r in fn(query, max_results=max_results):
+                    out.append({
+                        "url": r.get("href") or r.get("url", ""),
                         "title": r.get("title", ""),
-                        "snippet": r.get("body", r.get("snippet", "")),
+                        "snippet": r.get("body") or r.get("snippet", ""),
                         "source_type": "web",
                     })
-            return results
-        except Exception as e:
-            print(f"  [DuckDuckGo] Search error: {e}")
-            return []
+            return out
+
+        # Datacenter IPs (e.g. Render) get throttled often, so retry with a short backoff.
+        kinds = ["news", "text"] if strategy == "news" else ["text"]
+        for attempt in range(3):
+            for kind in kinds:
+                try:
+                    results = _run(kind)
+                    if results:
+                        return results
+                except Exception as e:
+                    print(f"  [DuckDuckGo] {kind} search error (attempt {attempt + 1}): {e}")
+            time.sleep(1.5 * (attempt + 1))
+        return []
 
 
 def get_search_provider() -> SearchProvider:
     """Select the best available search provider."""
     if TAVILY_API_KEY:
-        print("[Setup] Using Tavily search provider")
+        print("[Setup] Using Tavily search provider (DuckDuckGo as fallback)")
         return TavilySearchProvider(TAVILY_API_KEY)
-    else:
-        print("[Setup] Using DuckDuckGo search provider (no API key required)")
-        return DuckDuckGoSearchProvider()
+    print("[Setup] Using DuckDuckGo search provider (no API key required)")
+    return DuckDuckGoSearchProvider()
 
 
 # ============================================================
@@ -263,19 +291,14 @@ def get_search_provider() -> SearchProvider:
 def fetch_page_content(url: str, max_chars: int = MAX_PAGE_TOKENS) -> str:
     """Fetch clean markdown content from a URL using Jina Reader."""
     jina_url = f"https://r.jina.ai/{url}"
-    headers = {
-        "Accept": "text/markdown",
-        "X-Return-Format": "markdown",
-    }
+    headers = {"Accept": "text/markdown", "X-Return-Format": "markdown"}
     try:
-        with httpx.Client(timeout=20.0) as client:
+        with httpx.Client(timeout=25.0, follow_redirects=True) as client:
             resp = client.get(jina_url, headers=headers)
             if resp.status_code == 200:
-                content = resp.text[:max_chars]
-                return content
-            else:
-                print(f"  [Fetch] Jina returned {resp.status_code} for {url}")
-                return ""
+                return resp.text[:max_chars]
+            print(f"  [Fetch] Jina returned {resp.status_code} for {url}")
+            return ""
     except Exception as e:
         print(f"  [Fetch] Error fetching {url}: {e}")
         return ""
@@ -285,60 +308,90 @@ def fetch_page_content(url: str, max_chars: int = MAX_PAGE_TOKENS) -> str:
 # 6. LLM HELPER FUNCTIONS
 # ============================================================
 
+def _extract_json(text: str) -> Optional[str]:
+    """Pull a JSON object out of a model response (handles code fences and chatter)."""
+    text = (text or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    if fence:
+        text = fence.group(1).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        return text[start:end + 1]
+    return None
+
+
 def call_llm_structured(
     llm: ChatOpenAI,
     system_prompt: str,
     user_prompt: str,
     output_model: type,
 ) -> Optional[BaseModel]:
-    """Call LLM with structured output, with JSON fallback."""
+    """Call LLM with structured output (tool calling), then fall back to plain JSON."""
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+
+    # Attempt 1: function calling is the most widely supported structured mode on OpenRouter.
     try:
-        structured_llm = llm.with_structured_output(output_model)
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt),
-        ]
+        structured_llm = llm.with_structured_output(output_model, method="function_calling")
         result = structured_llm.invoke(messages)
-        return result
+        if result is not None:
+            return result
+        raise ValueError("model returned no structured result")
     except Exception as e:
-        print(f"  [LLM] Structured output failed ({e}), trying JSON fallback...")
-        try:
-            schema = output_model.model_json_schema()
-            json_instruction = (
-                f"\n\nIMPORTANT: Respond with ONLY a valid JSON object matching this schema:\n"
-                f"{json.dumps(schema, indent=2)}"
-            )
-            messages = [
-                SystemMessage(content=system_prompt),
-                HumanMessage(content=user_prompt + json_instruction),
-            ]
-            response = llm.invoke(messages)
-            content = response.content if hasattr(response, 'content') else str(response)
-            # Extract JSON from response
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                return output_model.model_validate_json(json_match.group())
-        except Exception as e2:
-            print(f"  [LLM] JSON fallback also failed: {e2}")
-        return None
+        print(f"  [LLM] Structured output failed ({str(e)[:200]}), trying JSON fallback...")
+
+    # Attempt 2: ask for raw JSON and parse it.
+    try:
+        schema = output_model.model_json_schema()
+        json_instruction = (
+            "\n\nIMPORTANT: Respond with ONLY a valid JSON object (no prose, no code fences) "
+            f"matching this schema:\n{json.dumps(schema, indent=2)}"
+        )
+        response = llm.invoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt + json_instruction),
+        ])
+        content = response.content if hasattr(response, "content") else str(response)
+        raw = _extract_json(content)
+        if raw:
+            return output_model.model_validate_json(raw)
+        print("  [LLM] JSON fallback: no JSON object found in response")
+    except Exception as e2:
+        print(f"  [LLM] JSON fallback also failed: {str(e2)[:200]}")
+    return None
 
 
-def call_llm_text(
-    llm: ChatOpenAI,
-    system_prompt: str,
-    user_prompt: str,
-) -> str:
+def call_llm_text(llm: ChatOpenAI, system_prompt: str, user_prompt: str) -> str:
     """Call LLM and return raw text."""
     try:
-        messages = [
+        response = llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
-        ]
-        response = llm.invoke(messages)
-        return response.content if hasattr(response, 'content') else str(response)
+        ])
+        return response.content if hasattr(response, "content") else str(response)
     except Exception as e:
-        print(f"  [LLM] Text call failed: {e}")
+        print(f"  [LLM] Text call failed: {str(e)[:200]}")
         return ""
+
+
+def to_search_query(text: str) -> str:
+    """Condense a natural-language sub-question into a short keyword search query."""
+    # Cheap deterministic cleanup first (removes "as of October 2026"-style noise).
+    cleaned = re.sub(r"\bas of\b[^?.,;]*", "", text, flags=re.I)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ?.")
+    try:
+        llm = create_llm(temperature=0.0, max_tokens=40)
+        q = call_llm_text(
+            llm,
+            "Rewrite the question as a concise web search query of at most 8 keywords. "
+            "Keep the key topic terms. Do not include dates unless essential. "
+            "Output ONLY the query, nothing else.",
+            cleaned or text,
+        ).strip().strip('"').strip("'")
+        if q and len(q) < 200:
+            return q
+    except Exception:
+        pass
+    return cleaned or text
 
 
 # ============================================================
@@ -347,56 +400,72 @@ def call_llm_text(
 
 def ingest_node(state: ResearchState) -> Dict[str, Any]:
     """Normalize input and apply basic guardrails."""
-    print("\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("[Node: Ingest] Processing user query...")
-    query = state["query"].strip()
+    query = (state.get("query") or "").strip()
     if not query:
         return {"status": "error", "error": "Empty query"}
-    # Basic guardrail: limit query length
     if len(query) > 2000:
         query = query[:2000]
-    print(f"  Query: {query[:100]}...")
+    print(f"  Query: {query[:100]}")
     return {
         "query": query,
         "status": "planning",
-        "messages": [f"[Ingest] Query received: {query[:80]}..."],
+        "messages": [f"[Ingest] Query received: {query[:80]}"],
     }
 
 
+def _normalize_plan(plan: List[SubQuestion]) -> List[SubQuestion]:
+    """Make an LLM-produced plan safe to execute (unique ids, pending status, valid deps)."""
+    cleaned: List[SubQuestion] = []
+    seen = set()
+    for i, sq in enumerate(plan[:MAX_SUBQUESTIONS], start=1):
+        if not sq.text or not sq.text.strip():
+            continue
+        sq_id = (sq.id or "").strip() or f"sq{i}"
+        if sq_id in seen:
+            sq_id = f"sq{i}_{len(seen)}"
+        seen.add(sq_id)
+        sq.id = sq_id
+        sq.status = SubQuestionStatus.PENDING
+        if sq.search_strategy not in ("general", "news", "academic", "domain"):
+            sq.search_strategy = "general"
+        cleaned.append(sq)
+    valid_ids = {sq.id for sq in cleaned}
+    for sq in cleaned:
+        sq.dependencies = [d for d in sq.dependencies if d in valid_ids and d != sq.id]
+    return cleaned
+
+
 def planner_node(state: ResearchState) -> Dict[str, Any]:
-    """Decompose the query into sub-questions using LLM."""
+    """Decompose the query into sub-questions using the LLM."""
     print("\n[Node: Planner] Decomposing query into sub-questions...")
     llm = create_llm(temperature=0.1)
+    today = datetime.now().strftime("%B %d, %Y")
 
-    # FIX: Get the current date so the LLM knows what "latest" means
-    current_date = datetime.now().strftime("%B %Y")
+    system_prompt = f"""You are an expert research planner. Break the user's research query into atomic sub-questions that can be answered through web search.
 
-    system_prompt = f"""You are an expert research planner. Your job is to break down a user's research query into atomic sub-questions that can be answered through web search.
+Today's date is {today}.
 
-    Today's date is {current_date}.
-    CRITICAL INSTRUCTION: Do NOT append "as of 2023" or past years to sub-questions. If the user asks for "latest" or "recent" information, formulate the search queries to target the current year ({current_date}) or recent months.
-
-    For each sub-question, specify:
-    1. A unique ID (e.g., "sq1", "sq2", etc.)
-    2. A clear, searchable question
-    3. The search strategy: "general" for broad web search, "news" for recent events, "academic" for research papers
-    4. What type of evidence is expected
-    5. Any dependencies on other sub-questions (by ID)
-
-    Guidelines:
-    - Make sub-questions specific and searchable
-    - Aim for 3-5 sub-questions for most queries
-    - Include both factual and analytical sub-questions
-    - If the query is comparative, include sub-questions for each entity
-    - If the query is temporal, include sub-questions for each time period
-    - Set status to "pending" for all sub-questions"""
+Rules:
+- Do NOT put dates, years, or phrases like "as of ..." inside the sub-question text. If recency matters, set the search strategy to "news" instead.
+- Make each sub-question specific and searchable.
+- Produce 3-5 sub-questions.
+- Include both factual and analytical sub-questions.
+- If the query is comparative, include a sub-question for each entity.
+- Sub-questions should be independent: leave "dependencies" as an empty list unless truly required.
+- Use ids "sq1", "sq2", ...
+- Search strategy: "general" for broad search, "news" for recent events, "academic" for research papers.
+- Set status to "pending" for all sub-questions."""
 
     user_prompt = f"Research query to decompose:\n\n{state['query']}"
-
     result = call_llm_structured(llm, system_prompt, user_prompt, ResearchPlan)
 
-    if result is None or not result.sub_questions:
-        # Fallback: create a single sub-question from the original query
+    plan: List[SubQuestion] = []
+    if result is not None and result.sub_questions:
+        plan = _normalize_plan(result.sub_questions)
+
+    if not plan:
         print("  [Planner] Fallback: using original query as single sub-question")
         plan = [SubQuestion(
             id="sq1",
@@ -407,10 +476,9 @@ def planner_node(state: ResearchState) -> Dict[str, Any]:
             status=SubQuestionStatus.PENDING,
         )]
     else:
-        plan = result.sub_questions
         print(f"  [Planner] Created {len(plan)} sub-questions:")
         for sq in plan:
-            print(f"    - {sq.id}: {sq.text[:80]}...")
+            print(f"    - {sq.id} [{sq.search_strategy}]: {sq.text[:90]}")
 
     return {
         "plan": plan,
@@ -424,22 +492,21 @@ def select_subquestion_node(state: ResearchState) -> Dict[str, Any]:
     print("\n[Node: Select] Looking for next sub-question to research...")
     plan = state["plan"]
 
-    # Find done sub-question IDs
     done_ids = {
         sq.id for sq in plan
         if sq.status in (SubQuestionStatus.DONE, SubQuestionStatus.SKIPPED)
     }
+    pending = [sq for sq in plan if sq.status == SubQuestionStatus.PENDING]
 
-    # Find next pending sub-question with met dependencies
-    next_sq = None
-    for sq in plan:
-        if sq.status == SubQuestionStatus.PENDING:
-            if all(dep in done_ids for dep in sq.dependencies):
-                next_sq = sq
-                break
+    next_sq = next((sq for sq in pending if all(d in done_ids for d in sq.dependencies)), None)
+
+    # Deadlock guard: pending items exist but all are blocked by dependencies.
+    if next_sq is None and pending:
+        print("  [Select] Dependency deadlock detected; running first pending sub-question anyway")
+        next_sq = pending[0]
+        next_sq.dependencies = []
 
     if next_sq is None:
-        # No more pending sub-questions
         print("  [Select] No more pending sub-questions. Moving to reflection.")
         return {
             "current_sq_id": None,
@@ -447,16 +514,14 @@ def select_subquestion_node(state: ResearchState) -> Dict[str, Any]:
             "messages": ["[Select] No more pending sub-questions"],
         }
 
-    # Mark as in_progress
     next_sq.status = SubQuestionStatus.IN_PROGRESS
-    print(f"  [Select] Selected: {next_sq.id} - {next_sq.text[:80]}...")
-
+    print(f"  [Select] Selected: {next_sq.id} - {next_sq.text[:90]}")
     return {
         "plan": plan,
         "current_sq_id": next_sq.id,
         "status": "searching",
-        "raw_search_results": [],  # clear previous results
-        "fetched_pages": [],  # clear previous pages
+        "raw_search_results": [],
+        "fetched_pages": [],
         "messages": [f"[Select] Selected sub-question: {next_sq.id}"],
     }
 
@@ -467,26 +532,28 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
     if not current_sq_id:
         return {"raw_search_results": []}
 
-    plan = state["plan"]
-    current_sq = next((sq for sq in plan if sq.id == current_sq_id), None)
+    current_sq = next((sq for sq in state["plan"] if sq.id == current_sq_id), None)
     if not current_sq:
         return {"raw_search_results": []}
 
-    print(f"\n[Node: Search] Searching for: {current_sq.text[:80]}...")
+    query = to_search_query(current_sq.text)
+    print(f"\n[Node: Search] Sub-question: {current_sq.text[:90]}")
+    print(f"  Search query: {query}")
     print(f"  Strategy: {current_sq.search_strategy}")
 
     provider = get_search_provider()
-    
-    # FIX: Pass the search strategy to the provider
-    results = provider.search(
-        current_sq.text, 
-        max_results=MAX_SEARCH_RESULTS, 
-        strategy=current_sq.search_strategy
-    )
+    results = provider.search(query, max_results=MAX_SEARCH_RESULTS, strategy=current_sq.search_strategy)
+
+    # Fall back to DuckDuckGo if the primary provider (Tavily) returned nothing.
+    if not results and not isinstance(provider, DuckDuckGoSearchProvider):
+        print("  [Search] Primary provider returned nothing, falling back to DuckDuckGo")
+        results = DuckDuckGoSearchProvider().search(
+            query, max_results=MAX_SEARCH_RESULTS, strategy=current_sq.search_strategy
+        )
 
     print(f"  [Search] Found {len(results)} results")
     for i, r in enumerate(results[:3]):
-        print(f"    {i+1}. {r.get('title', 'No title')[:60]}...")
+        print(f"    {i + 1}. {r.get('title', 'No title')[:60]}")
         print(f"       {r.get('url', '')[:80]}")
 
     return {
@@ -496,19 +563,25 @@ def search_node(state: ResearchState) -> Dict[str, Any]:
 
 
 def fetch_pages_node(state: ResearchState) -> Dict[str, Any]:
-    """Fetch full page content for top search results."""
+    """Fetch full page content for the top (not yet seen) search results."""
     search_results = state.get("raw_search_results", [])
     if not search_results:
         return {"fetched_pages": []}
 
-    print(f"\n[Node: Fetch] Fetching top {MAX_PAGES_PER_SUBQUESTION} pages...")
-    fetched = []
-    for result in search_results[:MAX_PAGES_PER_SUBQUESTION]:
-        url = result.get("url", "")
-        if not url:
-            continue
-        print(f"  [Fetch] Getting: {url[:80]}...")
+    seen = set(state.get("seen_urls", []))
+    candidates = [r for r in search_results if r.get("url") and r["url"] not in seen]
+
+    print(f"\n[Node: Fetch] Fetching up to {MAX_PAGES_PER_SUBQUESTION} pages...")
+    fetched, new_urls = [], []
+    for result in candidates[:MAX_PAGES_PER_SUBQUESTION]:
+        url = result["url"]
+        print(f"  [Fetch] Getting: {url[:80]}")
         content = fetch_page_content(url)
+        if content:
+            print(f"    -> {len(content)} chars retrieved")
+        elif result.get("snippet"):
+            content = result["snippet"]
+            print(f"    -> Using search snippet ({len(content)} chars)")
         if content:
             fetched.append({
                 "url": url,
@@ -516,73 +589,59 @@ def fetch_pages_node(state: ResearchState) -> Dict[str, Any]:
                 "content": content,
                 "snippet": result.get("snippet", ""),
             })
-            print(f"    -> {len(content)} chars retrieved")
-        else:
-            # Use snippet as fallback
-            if result.get("snippet"):
-                fetched.append({
-                    "url": url,
-                    "title": result.get("title", ""),
-                    "content": result["snippet"],
-                    "snippet": result["snippet"],
-                })
-                print(f"    -> Using snippet ({len(result['snippet'])} chars)")
-        time.sleep(0.5)  # Rate limiting
+            new_urls.append(url)
+        time.sleep(0.5)  # rate limiting
 
     print(f"  [Fetch] Fetched {len(fetched)} pages")
     return {
         "fetched_pages": fetched,
+        "seen_urls": new_urls,
         "messages": [f"[Fetch] Fetched {len(fetched)} pages"],
     }
 
 
 def extract_evidence_node(state: ResearchState) -> Dict[str, Any]:
-    """Extract relevant evidence from fetched pages using LLM."""
+    """Extract relevant evidence from fetched pages using the LLM."""
     current_sq_id = state.get("current_sq_id")
     plan = state["plan"]
-    
-    # FIX: Ensure we always find the sub-question and handle missing cases safely
     current_sq = next((sq for sq in plan if sq.id == current_sq_id), None)
-    
+
     if not current_sq:
-        print(f"  [Extract] Error: Could not find sub-question {current_sq_id} in plan!")
-        return {
-            "evidence": [],
-            "messages": [f"[Extract] Error: sub-question {current_sq_id} not found"],
-        }
+        print(f"  [Extract] Error: sub-question {current_sq_id} not found in plan")
+        return {"evidence": [], "messages": [f"[Extract] sub-question {current_sq_id} not found"]}
 
     fetched_pages = state.get("fetched_pages", [])
     if not fetched_pages:
-        # Mark sub-question as done with no evidence
         current_sq.status = SubQuestionStatus.DONE
+        print(f"  [Extract] No pages for {current_sq_id}")
         return {
             "plan": plan,
             "evidence": [],
             "messages": [f"[Extract] No pages to extract for {current_sq_id}"],
         }
 
-    print(f"\n[Node: Extract] Extracting evidence for: {current_sq.text[:60]}...")
+    print(f"\n[Node: Extract] Extracting evidence for: {current_sq.text[:70]}")
     llm = create_llm(temperature=0.0)
 
-    system_prompt = """You are an expert evidence extractor. Given web page content and a research question, extract the most relevant passages that help answer the question.
+    system_prompt = """You are an expert evidence extractor. Given web page content and a research question, extract the passages that help answer the question.
 
 For each piece of evidence:
 1. State the factual claim or finding clearly
-2. Provide the exact quote or close paraphrase
-3. Rate relevance from 0.0 to 1.0 (how directly does it answer the question?)
-4. Rate credibility from 0.0 to 1.0 (based on source authority and recency)
+2. Provide a short exact quote or close paraphrase as the snippet
+3. Rate relevance from 0.0 to 1.0 (how directly it answers the question)
+4. Rate credibility from 0.0 to 1.0 (source authority and recency)
 
 Guidelines:
-- Only extract evidence relevant to the specific sub-question
-- Prefer quantitative data over qualitative statements
-- Note any caveats mentioned in the source
-- If the page doesn't contain relevant evidence, return an empty list
-- Do not make up information - only extract what's actually in the text"""
+- Only extract evidence relevant to the specific question
+- If the page is off-topic (for example it is about a different subject with similar words), return an empty list
+- Prefer quantitative data over vague statements
+- Note caveats mentioned in the source
+- Do not make anything up; only extract what is in the text"""
 
-    all_evidence = []
-    for page in fetched_pages:
+    all_evidence: List[EvidenceItem] = []
+    for page in state.get("fetched_pages", []):
         page_content = page["content"][:MAX_PAGE_TOKENS]
-        user_prompt = f"""Sub-question to answer: {current_sq.text}
+        user_prompt = f"""Question to answer: {current_sq.text}
 
 Page title: {page.get('title', 'Unknown')}
 Page URL: {page.get('url', '')}
@@ -591,22 +650,25 @@ Page content:
 {page_content}
 ---
 
-Extract evidence from this page that helps answer the sub-question."""
+Extract evidence from this page that helps answer the question."""
 
         result = call_llm_structured(llm, system_prompt, user_prompt, ExtractedEvidence)
+        if not result or not result.evidence_items:
+            continue
 
-        if result and result.evidence_items:
-            for item in result.evidence_items:
-                item.sub_question_id = current_sq_id
-                item.source_url = page.get("url", item.source_url)
-                item.source_title = page.get("title", item.source_title)
-                all_evidence.append(item)
-                print(f"  [Extract] Found: {item.claim[:60]}... (rel={item.relevance}, cred={item.credibility})")
+        for item in result.evidence_items:
+            item.relevance = max(0.0, min(1.0, float(item.relevance)))
+            item.credibility = max(0.0, min(1.0, float(item.credibility)))
+            if item.relevance < MIN_RELEVANCE or not item.claim.strip():
+                continue
+            item.sub_question_id = current_sq_id
+            item.source_url = page.get("url", item.source_url)
+            item.source_title = page.get("title", item.source_title)
+            all_evidence.append(item)
+            print(f"  [Extract] Found: {item.claim[:70]} (rel={item.relevance}, cred={item.credibility})")
 
-    # FIX: Always mark as DONE to prevent infinite loops
-    current_sq.status = SubQuestionStatus.DONE
-    print(f"  [Extract] Total evidence items: {len(all_evidence)}")
-
+    current_sq.status = SubQuestionStatus.DONE  # always mark done to avoid infinite loops
+    print(f"  [Extract] Evidence items for {current_sq_id}: {len(all_evidence)}")
     return {
         "plan": plan,
         "evidence": all_evidence,
@@ -615,66 +677,52 @@ Extract evidence from this page that helps answer the sub-question."""
 
 
 def reflect_node(state: ResearchState) -> Dict[str, Any]:
-    """Evaluate whether collected evidence is sufficient."""
+    """Evaluate whether collected evidence is sufficient; add gap sub-questions if not."""
     print("\n[Node: Reflect] Evaluating evidence sufficiency...")
     iteration = state.get("iteration", 0) + 1
-
+    max_iter = state.get("max_iterations", MAX_ITERATIONS)
     evidence = state.get("evidence", [])
     plan = state["plan"]
-    print(f"  [Reflect] Iteration {iteration}/{state.get('max_iterations', MAX_ITERATIONS)}")
+
+    print(f"  [Reflect] Iteration {iteration}/{max_iter}")
     print(f"  [Reflect] Total evidence items: {len(evidence)}")
 
-    # FIX 1: Check max_iterations FIRST to prevent infinite loops
-    if iteration >= state.get("max_iterations", MAX_ITERATIONS):
-        print(f"  [Reflect] Max iterations reached, forcing synthesis")
-        return {
-            "iteration": iteration,
-            "status": "done",
-            "gaps": [],
-            "messages": ["[Reflect] Max iterations, forcing synthesis"],
-        }
-
-    # FIX 2: Clean up any stuck IN_PROGRESS sub-questions
-    # If a node failed to mark them DONE, we mark them DONE here so the graph can proceed.
+    # Clean up any sub-questions stuck in progress.
     for sq in plan:
         if sq.status == SubQuestionStatus.IN_PROGRESS:
             sq.status = SubQuestionStatus.DONE
-            print(f"  [Reflect] Cleaned up stuck IN_PROGRESS sub-question: {sq.id}")
 
-    # Check if there are still PENDING sub-questions to research
-    pending = [sq for sq in plan if sq.status == SubQuestionStatus.PENDING]
-    if pending:
-        print(f"  [Reflect] Still have {len(pending)} pending sub-questions.")
-        return {
-            "iteration": iteration,
-            "status": "searching",
-            "messages": ["[Reflect] Sub-questions still pending"],
-        }
+    if iteration >= max_iter:
+        print("  [Reflect] Max iterations reached, moving to synthesis")
+        return {"plan": plan, "iteration": iteration, "status": "done", "gaps": [],
+                "messages": ["[Reflect] Max iterations reached"]}
+
+    if not evidence:
+        # Searching is broken or returned nothing; looping again would waste calls.
+        print("  [Reflect] No evidence at all; stopping instead of looping")
+        return {"plan": plan, "iteration": iteration, "status": "done", "gaps": [],
+                "messages": ["[Reflect] No evidence collected"]}
 
     llm = create_llm(temperature=0.1)
 
-    system_prompt = """You are a research reflector. Evaluate whether the collected evidence is sufficient to comprehensively answer the user's original query.
+    system_prompt = f"""You are a research reflector. Decide whether the collected evidence is sufficient to comprehensively answer the user's original query.
 
 Consider:
 1. Are all aspects of the query addressed?
-2. Is evidence corroborated by multiple sources?
-3. Are there contradictions that need resolution?
-4. Are there obvious gaps in the research?
+2. Is the evidence corroborated by multiple sources?
+3. Are there contradictions?
+4. Are there obvious gaps?
 
-If the evidence is insufficient, identify specific gaps as new sub-questions that should be researched. These should be atomic and searchable. Assign them IDs like "sq_gap_1", "sq_gap_2", etc., set status to "pending", and use "general" search strategy.
+If insufficient, list up to {MAX_GAP_QUESTIONS} gaps as new atomic, searchable sub-questions (no dates or "as of" phrases). Give them ids like "sq_gap_1", status "pending", strategy "general", and no dependencies.
+Rate your confidence in the current evidence from 0.0 to 1.0."""
 
-Rate your confidence in the current evidence (0.0 to 1.0)."""
-
-    # Format evidence for the LLM
     evidence_text = ""
-    for i, ev in enumerate(evidence):
-        evidence_text += f"\n[Evidence {i+1}]\n"
-        evidence_text += f"  Claim: {ev.claim}\n"
-        evidence_text += f"  Source: {ev.source_url}\n"
-        evidence_text += f"  Relevance: {ev.relevance}\n"
-        evidence_text += f"  Credibility: {ev.credibility}\n"
-        evidence_text += f"  Sub-question: {ev.sub_question_id}\n"
-
+    for i, ev in enumerate(evidence[:MAX_EVIDENCE_FOR_SYNTHESIS], start=1):
+        evidence_text += (
+            f"\n[Evidence {i}] {ev.claim}\n"
+            f"  Source: {ev.source_url} | Sub-question: {ev.sub_question_id} "
+            f"| rel={ev.relevance} cred={ev.credibility}\n"
+        )
     plan_text = "\n".join(f"  - {sq.id}: {sq.text} [{sq.status.value}]" for sq in plan)
 
     user_prompt = f"""Original query: {state['query']}
@@ -683,56 +731,50 @@ Research plan:
 {plan_text}
 
 Collected evidence ({len(evidence)} items):
-{evidence_text if evidence else "(No evidence collected yet)"}
+{evidence_text}
 
 Evaluate whether this evidence is sufficient to answer the original query."""
 
     result = call_llm_structured(llm, system_prompt, user_prompt, ReflectionResult)
 
     if result is None:
-        # If reflection fails, assume sufficient to avoid infinite loop
         print("  [Reflect] Reflection failed, proceeding to synthesis")
-        return {
-            "iteration": iteration,
-            "status": "done",
-            "messages": ["[Reflect] Failed, forcing synthesis"],
-        }
+        return {"plan": plan, "iteration": iteration, "status": "done",
+                "messages": ["[Reflect] Failed, proceeding to synthesis"]}
 
-    print(f"  [Reflect] Sufficient: {result.is_sufficient}")
-    print(f"  [Reflect] Confidence: {result.confidence}")
-    print(f"  [Reflect] Gaps: {len(result.gaps)}")
+    print(f"  [Reflect] Sufficient: {result.is_sufficient} | Confidence: {result.confidence} "
+          f"| Gaps: {len(result.gaps)}")
 
-    if result.is_sufficient:
-        return {
-            "iteration": iteration,
-            "status": "done",
-            "gaps": [],
-            "messages": [f"[Reflect] Sufficient (confidence={result.confidence})"],
-        }
+    if result.is_sufficient or (not result.gaps and not result.new_sub_questions):
+        return {"plan": plan, "iteration": iteration, "status": "done", "gaps": [],
+                "messages": [f"[Reflect] Sufficient (confidence={result.confidence})"]}
 
-    # Add new sub-questions to plan
+    existing_ids = {sq.id for sq in plan}
+    new_items: List[SubQuestion] = []
     if result.new_sub_questions:
-        for sq in result.new_sub_questions:
+        for sq in result.new_sub_questions[:MAX_GAP_QUESTIONS]:
             sq.status = SubQuestionStatus.PENDING
-        updated_plan = plan + result.new_sub_questions
-        print(f"  [Reflect] Added {len(result.new_sub_questions)} new sub-questions")
+            sq.dependencies = []
+            if sq.id in existing_ids or not sq.id:
+                sq.id = f"sq_gap_{iteration}_{len(new_items) + 1}"
+            if sq.search_strategy not in ("general", "news", "academic", "domain"):
+                sq.search_strategy = "general"
+            existing_ids.add(sq.id)
+            new_items.append(sq)
     else:
-        # Create sub-questions from gaps text
-        updated_plan = plan
-        for i, gap in enumerate(result.gaps):
-            sq = SubQuestion(
-                id=f"sq_gap_{i+1}",
+        for i, gap in enumerate(result.gaps[:MAX_GAP_QUESTIONS], start=1):
+            new_items.append(SubQuestion(
+                id=f"sq_gap_{iteration}_{i}",
                 text=gap,
                 search_strategy="general",
                 expected_evidence="general information",
                 dependencies=[],
                 status=SubQuestionStatus.PENDING,
-            )
-            updated_plan.append(sq)
-            print(f"  [Reflect] Created gap sub-question: {sq.id}")
+            ))
 
+    print(f"  [Reflect] Added {len(new_items)} gap sub-questions")
     return {
-        "plan": updated_plan,
+        "plan": plan + new_items,
         "iteration": iteration,
         "status": "searching",
         "gaps": result.gaps,
@@ -740,86 +782,126 @@ Evaluate whether this evidence is sufficient to answer the original query."""
     }
 
 
-def synthesize_node(state: ResearchState) -> Dict[str, Any]:
-    """Compose final answer with citations."""
-    print("\n[Node: Synthesize] Composing final answer...")
-    
-    # FIX: Increased max_tokens to allow for a much longer, detailed output
-    llm = create_llm(temperature=0.2, max_tokens=8000)
+def _split_followups(text: str) -> List[str]:
+    """Pull bullet items out of a trailing 'Follow-up' section, if present."""
+    m = re.search(r"\n#+\s*[^\n]*follow[- ]?up[^\n]*\n(.*)$", text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+    items = []
+    for line in m.group(1).splitlines():
+        line = re.sub(r"^[\s\-\*\d\.\)]+", "", line).strip()
+        if line:
+            items.append(line)
+    return items[:3]
 
-    evidence = state.get("evidence", [])
+
+def synthesize_node(state: ResearchState) -> Dict[str, Any]:
+    """Compose the final cited answer."""
+    print("\n[Node: Synthesize] Composing final answer...")
+    evidence = list(state.get("evidence", []))
     gaps = state.get("gaps", [])
     iteration = state.get("iteration", 0)
 
-    system_prompt = """You are an expert research synthesizer. Compose a highly detailed, long-form, comprehensive research report answering the user's query using ONLY the provided evidence.
+    # Never write a report from nothing.
+    if not evidence:
+        print("  [Synthesize] No evidence; returning failure message without an LLM call")
+        result = FinalAnswer(
+            answer=(
+                "**No sources could be retrieved, so no report was generated.**\n\n"
+                "Check the Render logs for search errors (Tavily 401 or DuckDuckGo timeouts), "
+                "confirm the API keys are set, and try again."
+            ),
+            citations=[],
+            confidence=0.0,
+            follow_up_questions=[],
+            caveats="Zero evidence items were collected.",
+        )
+        return {"final_answer": result, "status": "done",
+                "messages": ["[Synthesize] Skipped: no evidence"]}
 
-Guidelines:
-- Write a minimum of 4-6 detailed paragraphs.
-- Use Markdown formatting with clear headings (##) and subheadings (###) to structure the report logically.
-- Include inline citations as [1], [2], etc., where each number corresponds to the evidence item.
-- Do not summarize too briefly; expand on the findings, provide context, and explain the significance of the data.
-- If evidence is insufficient for part of the answer, state so explicitly and explain what is missing.
-- Acknowledge uncertainties and conflicting evidence.
-- If max iterations were reached without sufficient evidence, note the caveats.
-- Rate your overall confidence in the answer (0.0 to 1.0).
-- Suggest 1-3 follow-up questions for further research.
-- List all source URLs in the citations field."""
+    # Keep the strongest evidence.
+    evidence.sort(key=lambda e: e.relevance * e.credibility, reverse=True)
+    evidence = evidence[:MAX_EVIDENCE_FOR_SYNTHESIS]
 
-    # Format evidence with citation numbers
+    # Number sources by unique URL so citations stay consistent.
+    source_numbers: Dict[str, int] = {}
+    citations: List[Dict[str, str]] = []
+    for ev in evidence:
+        if ev.source_url not in source_numbers:
+            source_numbers[ev.source_url] = len(source_numbers) + 1
+            citations.append({
+                "citation_id": f"[{source_numbers[ev.source_url]}]",
+                "url": ev.source_url,
+                "title": ev.source_title or ev.source_url,
+            })
+
     evidence_text = ""
-    citations = []
-    for i, ev in enumerate(evidence):
-        citation_id = f"[{i+1}]"
-        evidence_text += f"\n{citation_id} Claim: {ev.claim}\n"
-        evidence_text += f"   Source: {ev.source_url}\n"
-        evidence_text += f"   Title: {ev.source_title}\n"
-        evidence_text += f"   Relevance: {ev.relevance}, Credibility: {ev.credibility}\n"
-        evidence_text += f"   Quote: {ev.snippet[:200]}...\n"
-        citations.append({
-            "citation_id": citation_id,
-            "url": ev.source_url,
-            "title": ev.source_title,
-        })
+    for ev in evidence:
+        n = source_numbers[ev.source_url]
+        evidence_text += (
+            f"\n[{n}] {ev.claim}\n"
+            f"    Source: {ev.source_title} ({ev.source_url})\n"
+            f"    Quote: {ev.snippet[:250]}\n"
+        )
 
     plan_text = "\n".join(f"  - {sq.id}: {sq.text}" for sq in state["plan"])
 
-    caveats = ""
-    if gaps:
-        caveats = f"Research gaps identified: {'; '.join(gaps)}"
-    if iteration >= state.get("max_iterations", MAX_ITERATIONS):
-        caveats += " Maximum research iterations reached; answer may be incomplete."
+    system_prompt = """You are an expert research synthesizer. Write a detailed, long-form research report answering the user's query using ONLY the provided evidence.
+
+Guidelines:
+- Use Markdown with a title, an executive summary, and clear ## and ### headings.
+- Write at least 4-6 substantial paragraphs; explain significance and context, not just facts.
+- Cite with inline numbers like [1], [2] that match the source numbers in the evidence list. Cite every factual claim.
+- If evidence is thin or missing for part of the query, say so explicitly. Do not fill gaps from memory.
+- Note conflicting evidence and uncertainty.
+- End with a section titled "## Suggested Follow-up Questions" containing 1-3 bullet points.
+- Do not include a references list; it is added separately."""
 
     user_prompt = f"""Original query: {state['query']}
 
 Research plan:
 {plan_text}
 
-Collected evidence ({len(evidence)} items):
-{evidence_text if evidence else "(No evidence was collected)"}
+Evidence ({len(evidence)} items from {len(citations)} sources):
+{evidence_text}
 
 Known gaps: {'; '.join(gaps) if gaps else 'None'}
-Iterations completed: {iteration}
 
-Synthesize a highly detailed, comprehensive answer with citations."""
+Write the report."""
 
-    result = call_llm_structured(llm, system_prompt, user_prompt, FinalAnswer)
+    llm = create_llm(temperature=0.2, max_tokens=8000)
+    answer_text = call_llm_text(llm, system_prompt, user_prompt).strip()
 
-    if result is None:
-        # Fallback: generate text answer
-        print("  [Synthesize] Structured output failed, using text fallback")
-        text_answer = call_llm_text(llm, system_prompt, user_prompt)
-        result = FinalAnswer(
-            answer=text_answer,
-            citations=citations,
-            confidence=0.3,
-            follow_up_questions=[],
-            caveats="Fallback synthesis used due to structured output failure.",
-        )
+    if not answer_text:
+        answer_text = "The report could not be generated because the language model call failed. See server logs."
+        confidence = 0.1
+    else:
+        # Confidence heuristic from evidence quality and sub-question coverage.
+        quality = sum(e.relevance * e.credibility for e in evidence) / len(evidence)
+        covered = {e.sub_question_id for e in evidence}
+        total_sq = max(1, len(state["plan"]))
+        coverage = min(1.0, len(covered) / total_sq)
+        confidence = round(max(0.05, min(0.95, quality * (0.5 + 0.5 * coverage))), 2)
+
+    caveats = []
+    if gaps:
+        caveats.append(f"Research gaps identified: {'; '.join(gaps)}.")
+    if iteration >= state.get("max_iterations", MAX_ITERATIONS):
+        caveats.append("Maximum research iterations reached; the answer may be incomplete.")
+    if len(citations) < 3:
+        caveats.append("Fewer than three independent sources were found.")
+
+    result = FinalAnswer(
+        answer=answer_text,
+        citations=citations,
+        confidence=confidence,
+        follow_up_questions=_split_followups(answer_text),
+        caveats=" ".join(caveats),
+    )
 
     print(f"\n  [Synthesize] Answer length: {len(result.answer)} chars")
     print(f"  [Synthesize] Citations: {len(result.citations)}")
     print(f"  [Synthesize] Confidence: {result.confidence}")
-
     return {
         "final_answer": result,
         "status": "done",
@@ -832,27 +914,13 @@ Synthesize a highly detailed, comprehensive answer with citations."""
 # ============================================================
 
 def route_after_select(state: ResearchState) -> str:
-    """Route after sub-question selection."""
-    if state.get("status") == "reflecting":
+    if state.get("status") == "reflecting" or not state.get("current_sq_id"):
         return "reflect"
-    if state.get("current_sq_id"):
-        return "search"
-    return "reflect"
-
-
-def route_after_extract(state: ResearchState) -> str:
-    """Route after evidence extraction - always go back to select."""
-    return "select"
+    return "search"
 
 
 def route_after_reflect(state: ResearchState) -> str:
-    """Route after reflection."""
-    status = state.get("status", "")
-    if status == "done":
-        return "synthesize"
-    if status == "searching":
-        return "select"
-    return "synthesize"
+    return "select" if state.get("status") == "searching" else "synthesize"
 
 
 # ============================================================
@@ -863,7 +931,6 @@ def build_research_graph():
     """Build and compile the LangGraph research agent."""
     graph = StateGraph(ResearchState)
 
-    # Add nodes
     graph.add_node("ingest", ingest_node)
     graph.add_node("plan", planner_node)
     graph.add_node("select", select_subquestion_node)
@@ -873,59 +940,35 @@ def build_research_graph():
     graph.add_node("reflect", reflect_node)
     graph.add_node("synthesize", synthesize_node)
 
-    # Add edges
     graph.add_edge(START, "ingest")
     graph.add_edge("ingest", "plan")
     graph.add_edge("plan", "select")
 
-    # Conditional routing after select
     graph.add_conditional_edges(
-        "select",
-        route_after_select,
-        {"search": "search", "reflect": "reflect"},
+        "select", route_after_select, {"search": "search", "reflect": "reflect"}
     )
 
-    # Search -> Fetch -> Extract -> Select (inner loop)
+    # Inner loop: search -> fetch -> extract -> select
     graph.add_edge("search", "fetch")
     graph.add_edge("fetch", "extract")
+    graph.add_edge("extract", "select")
+
     graph.add_conditional_edges(
-        "extract",
-        route_after_extract,
-        {"select": "select"},
+        "reflect", route_after_reflect, {"select": "select", "synthesize": "synthesize"}
     )
 
-    # Conditional routing after reflect
-    graph.add_conditional_edges(
-        "reflect",
-        route_after_reflect,
-        {"select": "select", "synthesize": "synthesize"},
-    )
-
-    # Synthesize -> END
     graph.add_edge("synthesize", END)
 
-    # Compile with memory checkpointing
-    memory = MemorySaver()
-    compiled = graph.compile(checkpointer=memory)
-    return compiled
+    return graph.compile(checkpointer=MemorySaver())
 
 
 # ============================================================
 # 10. MAIN EXECUTION
 # ============================================================
 
-def run_research(query: str, thread_id: str = "research_session_1") -> FinalAnswer:
-    """Run the research agent on a query."""
-    print(f"\n{'='*60}")
-    print(f"RESEARCH AGENT STARTING")
-    print(f"Query: {query}")
-    print(f"Model: {DEFAULT_MODEL}")
-    print(f"Max iterations: {MAX_ITERATIONS}")
-    print(f"{'='*60}")
-
-    graph = build_research_graph()
-
-    initial_state = {
+def build_initial_state(query: str, max_iterations: int = MAX_ITERATIONS) -> Dict[str, Any]:
+    """Initial state for the graph (use this if app.py streams the graph itself)."""
+    return {
         "query": query,
         "plan": [],
         "current_sq_id": None,
@@ -933,17 +976,36 @@ def run_research(query: str, thread_id: str = "research_session_1") -> FinalAnsw
         "gaps": [],
         "raw_search_results": [],
         "fetched_pages": [],
+        "seen_urls": [],
         "iteration": 0,
-        "max_iterations": MAX_ITERATIONS,
+        "max_iterations": max_iterations,
         "status": "planning",
         "error": None,
         "final_answer": None,
         "messages": [],
     }
 
-    config = {"configurable": {"thread_id": thread_id}}
 
-    final_state = graph.invoke(initial_state, config=config)
+def run_research(
+    query: str,
+    thread_id: str = "research_session_1",
+    max_iterations: int = MAX_ITERATIONS,
+) -> FinalAnswer:
+    """Run the research agent on a query."""
+    print(f"\n{'=' * 60}")
+    print("RESEARCH AGENT STARTING")
+    print(f"Query: {query}")
+    print(f"Model: {DEFAULT_MODEL}")
+    print(f"Max iterations: {max_iterations}")
+    print(f"{'=' * 60}")
+
+    graph = build_research_graph()
+    config = {
+        "configurable": {"thread_id": thread_id},
+        "recursion_limit": RECURSION_LIMIT,
+    }
+
+    final_state = graph.invoke(build_initial_state(query, max_iterations), config=config)
 
     answer = final_state.get("final_answer")
     if answer is None:
@@ -952,8 +1014,14 @@ def run_research(query: str, thread_id: str = "research_session_1") -> FinalAnsw
             citations=[],
             confidence=0.0,
             follow_up_questions=[],
-            caveats="Agent did not reach synthesis.",
+            caveats=final_state.get("error") or "Agent did not reach synthesis.",
         )
-
     return answer
 
+
+if __name__ == "__main__":
+    out = run_research("Explain agentic AI, its applications, benefits, and risks.", max_iterations=2)
+    print("\n" + out.answer)
+    print("\nConfidence:", out.confidence)
+    for c in out.citations:
+        print(c["citation_id"], c["title"], c["url"])
