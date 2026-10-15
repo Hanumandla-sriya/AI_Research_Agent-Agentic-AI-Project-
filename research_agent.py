@@ -38,28 +38,34 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip().strip('"').strip("'")
 
 
-OPENROUTER_API_KEY = _env("OPENROUTER_API_KEY")
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# Set OPENROUTER_MODEL in your environment. Old slugs (e.g. anthropic/claude-3.5-sonnet)
-# can return "404 No endpoints found", so copy a current slug from openrouter.ai/models.
-DEFAULT_MODEL = _env("OPENROUTER_MODEL", "anthropic/claude-sonnet-4.5")
+# Any OpenAI-compatible provider works (Gemini, Groq, OpenRouter, ...).
+#   LLM_API_KEY   - the provider's API key   (falls back to OPENROUTER_API_KEY)
+#   LLM_BASE_URL  - the provider's OpenAI-compatible endpoint (default: OpenRouter)
+#   LLM_MODEL     - exact model name for that provider (falls back to OPENROUTER_MODEL)
+LLM_API_KEY = _env("LLM_API_KEY") or _env("OPENROUTER_API_KEY")
+LLM_BASE_URL = _env("LLM_BASE_URL") or "https://openrouter.ai/api/v1"
+DEFAULT_MODEL = _env("LLM_MODEL") or _env("OPENROUTER_MODEL") or "anthropic/claude-sonnet-4.5"
+# Backwards-compatible aliases (app.py may still reference these names)
+OPENROUTER_API_KEY = LLM_API_KEY
+OPENROUTER_BASE_URL = LLM_BASE_URL
 TAVILY_API_KEY = _env("TAVILY_API_KEY")
+LLM_MIN_INTERVAL = float(_env("LLM_MIN_INTERVAL", "4"))  # seconds between LLM calls (free tiers cap requests/minute)
 
 MAX_ITERATIONS = 3          # research rounds (1 = single pass, no gap-filling loop)
-MAX_SUBQUESTIONS = 5        # cap on the initial plan size
+MAX_SUBQUESTIONS = 4        # cap on the initial plan size (fewer = fewer LLM calls)
 MAX_GAP_QUESTIONS = 3       # cap on new sub-questions per reflection round
 MAX_SEARCH_RESULTS = 6
 MAX_PAGES_PER_SUBQUESTION = 3
 MAX_PAGE_TOKENS = 6000      # character budget per page
 MIN_RELEVANCE = 0.4         # drop evidence below this relevance
-MAX_EVIDENCE_FOR_SYNTHESIS = 40
+MAX_EVIDENCE_FOR_SYNTHESIS = 30
 RECURSION_LIMIT = 150       # LangGraph default (25) is too low for multi-sub-question runs
 
 
 def create_llm(temperature: float = 0.1, max_tokens: int = 4000):
     """Create an LLM instance connected to OpenRouter."""
     if not OPENROUTER_API_KEY:
-        raise ValueError("Set the OPENROUTER_API_KEY environment variable.")
+        raise ValueError("Set the LLM_API_KEY (or OPENROUTER_API_KEY) environment variable.")
     return ChatOpenAI(
         model=DEFAULT_MODEL,
         openai_api_base=OPENROUTER_BASE_URL,
@@ -320,6 +326,39 @@ def _extract_json(text: str) -> Optional[str]:
     return None
 
 
+_last_llm_call = 0.0
+LLM_ERRORS: List[str] = []   # quota / rate-limit errors seen during the current run
+
+
+def _throttle() -> None:
+    """Space out LLM calls so free-tier requests-per-minute limits are respected."""
+    global _last_llm_call
+    wait = LLM_MIN_INTERVAL - (time.time() - _last_llm_call)
+    if wait > 0:
+        time.sleep(wait)
+    _last_llm_call = time.time()
+
+
+def _is_quota_error(e: Exception) -> bool:
+    s_ = str(e)
+    return ("429" in s_ or "rate limit" in s_.lower() or "quota" in s_.lower()
+            or "RESOURCE_EXHAUSTED" in s_)
+
+
+def _record_llm_error(e: Exception) -> None:
+    msg = str(e)[:300]
+    print(f"  [LLM] Rate limit / quota error: {msg}")
+    LLM_ERRORS.append(msg)
+
+
+def _failure_hint() -> str:
+    if not LLM_ERRORS:
+        return ""
+    return ("\n\nThe LLM provider returned a rate-limit or quota error "
+            f"({LLM_ERRORS[-1][:120]}). Wait for the limit to reset, switch to another "
+            "free provider or model, or increase LLM_MIN_INTERVAL.")
+
+
 def call_llm_structured(
     llm: ChatOpenAI,
     system_prompt: str,
@@ -329,14 +368,18 @@ def call_llm_structured(
     """Call LLM with structured output (tool calling), then fall back to plain JSON."""
     messages = [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
 
-    # Attempt 1: function calling is the most widely supported structured mode on OpenRouter.
+    # Attempt 1: function calling is the most widely supported structured mode.
     try:
+        _throttle()
         structured_llm = llm.with_structured_output(output_model, method="function_calling")
         result = structured_llm.invoke(messages)
         if result is not None:
             return result
         raise ValueError("model returned no structured result")
     except Exception as e:
+        if _is_quota_error(e):
+            _record_llm_error(e)
+            return None  # a JSON retry would only burn more quota
         print(f"  [LLM] Structured output failed ({str(e)[:200]}), trying JSON fallback...")
 
     # Attempt 2: ask for raw JSON and parse it.
@@ -346,6 +389,7 @@ def call_llm_structured(
             "\n\nIMPORTANT: Respond with ONLY a valid JSON object (no prose, no code fences) "
             f"matching this schema:\n{json.dumps(schema, indent=2)}"
         )
+        _throttle()
         response = llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt + json_instruction),
@@ -356,42 +400,43 @@ def call_llm_structured(
             return output_model.model_validate_json(raw)
         print("  [LLM] JSON fallback: no JSON object found in response")
     except Exception as e2:
-        print(f"  [LLM] JSON fallback also failed: {str(e2)[:200]}")
+        if _is_quota_error(e2):
+            _record_llm_error(e2)
+        else:
+            print(f"  [LLM] JSON fallback also failed: {str(e2)[:200]}")
     return None
 
 
 def call_llm_text(llm: ChatOpenAI, system_prompt: str, user_prompt: str) -> str:
     """Call LLM and return raw text."""
     try:
+        _throttle()
         response = llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt),
         ])
         return response.content if hasattr(response, "content") else str(response)
     except Exception as e:
-        print(f"  [LLM] Text call failed: {str(e)[:200]}")
+        if _is_quota_error(e):
+            _record_llm_error(e)
+        else:
+            print(f"  [LLM] Text call failed: {str(e)[:200]}")
         return ""
 
 
 def to_search_query(text: str) -> str:
-    """Condense a natural-language sub-question into a short keyword search query."""
-    # Cheap deterministic cleanup first (removes "as of October 2026"-style noise).
-    cleaned = re.sub(r"\bas of\b[^?.,;]*", "", text, flags=re.I)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ?.")
-    try:
-        llm = create_llm(temperature=0.0, max_tokens=40)
-        q = call_llm_text(
-            llm,
-            "Rewrite the question as a concise web search query of at most 8 keywords. "
-            "Keep the key topic terms. Do not include dates unless essential. "
-            "Output ONLY the query, nothing else.",
-            cleaned or text,
-        ).strip().strip('"').strip("'")
-        if q and len(q) < 200:
-            return q
-    except Exception:
-        pass
-    return cleaned or text
+    """Condense a sub-question into a short keyword query (no LLM call, saves quota)."""
+    q = re.sub(r"\([^)]*\)", " ", text)                      # drop parentheticals
+    q = re.sub(r"\bas of\b[^?.,;]*", " ", q, flags=re.I)       # drop "as of <date>"
+    q = re.sub(
+        r"\b(what|how|why|which|who|are|is|do|does|can|could|should|the|of|in|and|to|an|be|"
+        r"being|been|with|for|on|by|their|its|that|this|these|those|there|currently)\b",
+        " ", q, flags=re.I,
+    )
+    q = re.sub(r"[^\w\s\-\+\.]", " ", q)
+    words = q.split()[:12]
+    cleaned = " ".join(words).strip()
+    return cleaned or text[:150]
 
 
 # ============================================================
@@ -638,34 +683,50 @@ Guidelines:
 - Note caveats mentioned in the source
 - Do not make anything up; only extract what is in the text"""
 
+    pages = state.get("fetched_pages", [])
+    per_page = max(1500, 9000 // max(1, len(pages)))
+    url_titles = {p["url"]: p.get("title", "") for p in pages}
+
+    sources_text = ""
+    for i, page in enumerate(pages, start=1):
+        sources_text += (
+            f"\n=== SOURCE {i} ===\nTitle: {page.get('title', 'Unknown')}\n"
+            f"URL: {page['url']}\nContent:\n{page['content'][:per_page]}\n"
+        )
+
+    user_prompt = f"""Question to answer: {current_sq.text}
+
+Below are {len(pages)} sources. For every evidence item, set source_url to the exact URL of the source it came from.
+{sources_text}
+
+Extract evidence from these sources that helps answer the question."""
+
     all_evidence: List[EvidenceItem] = []
-    for page in state.get("fetched_pages", []):
-        page_content = page["content"][:MAX_PAGE_TOKENS]
-        user_prompt = f"""Question to answer: {current_sq.text}
-
-Page title: {page.get('title', 'Unknown')}
-Page URL: {page.get('url', '')}
-Page content:
----
-{page_content}
----
-
-Extract evidence from this page that helps answer the question."""
-
-        result = call_llm_structured(llm, system_prompt, user_prompt, ExtractedEvidence)
-        if not result or not result.evidence_items:
-            continue
-
+    result = call_llm_structured(llm, system_prompt, user_prompt, ExtractedEvidence)
+    if result and result.evidence_items:
+        skipped = 0
         for item in result.evidence_items:
             item.relevance = max(0.0, min(1.0, float(item.relevance)))
             item.credibility = max(0.0, min(1.0, float(item.credibility)))
             if item.relevance < MIN_RELEVANCE or not item.claim.strip():
                 continue
+            url = item.source_url
+            if url not in url_titles:
+                match = next((u for u in url_titles if url and (u in url or url in u)), None)
+                if match:
+                    url = match
+                elif len(pages) == 1:
+                    url = pages[0]["url"]
+                else:
+                    skipped += 1   # cannot attribute this claim to a source reliably
+                    continue
+            item.source_url = url
+            item.source_title = url_titles[url]
             item.sub_question_id = current_sq_id
-            item.source_url = page.get("url", item.source_url)
-            item.source_title = page.get("title", item.source_title)
             all_evidence.append(item)
             print(f"  [Extract] Found: {item.claim[:70]} (rel={item.relevance}, cred={item.credibility})")
+        if skipped:
+            print(f"  [Extract] Skipped {skipped} items with no matching source URL")
 
     current_sq.status = SubQuestionStatus.DONE  # always mark done to avoid infinite loops
     print(f"  [Extract] Evidence items for {current_sq_id}: {len(all_evidence)}")
@@ -810,6 +871,7 @@ def synthesize_node(state: ResearchState) -> Dict[str, Any]:
                 "**No sources could be retrieved, so no report was generated.**\n\n"
                 "Check the Render logs for search errors (Tavily 401 or DuckDuckGo timeouts), "
                 "confirm the API keys are set, and try again."
+                + _failure_hint()
             ),
             citations=[],
             confidence=0.0,
@@ -869,11 +931,20 @@ Known gaps: {'; '.join(gaps) if gaps else 'None'}
 
 Write the report."""
 
-    llm = create_llm(temperature=0.2, max_tokens=8000)
+    llm = create_llm(temperature=0.2, max_tokens=6000)
     answer_text = call_llm_text(llm, system_prompt, user_prompt).strip()
 
     if not answer_text:
-        answer_text = "The report could not be generated because the language model call failed. See server logs."
+        lines = [
+            "# Evidence summary",
+            "",
+            "The language model could not write the full report, so here are the "
+            "evidence items that were collected (numbers match the sources list).",
+            "",
+        ]
+        for ev in evidence:
+            lines.append(f"- {ev.claim} [{source_numbers[ev.source_url]}]")
+        answer_text = "\n".join(lines) + _failure_hint()
         confidence = 0.1
     else:
         # Confidence heuristic from evidence quality and sub-question coverage.
@@ -996,6 +1067,8 @@ def run_research(
     print("RESEARCH AGENT STARTING")
     print(f"Query: {query}")
     print(f"Model: {DEFAULT_MODEL}")
+    print(f"LLM endpoint: {LLM_BASE_URL}")
+    LLM_ERRORS.clear()
     print(f"Max iterations: {max_iterations}")
     print(f"{'=' * 60}")
 
