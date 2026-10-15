@@ -73,7 +73,7 @@ def create_llm(temperature: float = 0.1, max_tokens: int = 4000):
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=90,
-        max_retries=2,
+        max_retries=1,
     )
 
 
@@ -354,9 +354,10 @@ def _record_llm_error(e: Exception) -> None:
 def _failure_hint() -> str:
     if not LLM_ERRORS:
         return ""
-    return ("\n\nThe LLM provider returned a rate-limit or quota error "
-            f"({LLM_ERRORS[-1][:120]}). Wait for the limit to reset, switch to another "
-            "free provider or model, or increase LLM_MIN_INTERVAL.")
+    last = LLM_ERRORS[-1][:300]
+    return ("\n\n**LLM error:** " + last +
+            "\n\nFix: check LLM_API_KEY / LLM_BASE_URL / LLM_MODEL, wait if it is a rate limit, "
+            "or increase LLM_MIN_INTERVAL.")
 
 
 def call_llm_structured(
@@ -399,11 +400,13 @@ def call_llm_structured(
         if raw:
             return output_model.model_validate_json(raw)
         print("  [LLM] JSON fallback: no JSON object found in response")
+        LLM_ERRORS.append("Model did not return valid structured output.")
     except Exception as e2:
         if _is_quota_error(e2):
             _record_llm_error(e2)
         else:
             print(f"  [LLM] JSON fallback also failed: {str(e2)[:200]}")
+            LLM_ERRORS.append(str(e2)[:300])
     return None
 
 
@@ -421,6 +424,7 @@ def call_llm_text(llm: ChatOpenAI, system_prompt: str, user_prompt: str) -> str:
             _record_llm_error(e)
         else:
             print(f"  [LLM] Text call failed: {str(e)[:200]}")
+            LLM_ERRORS.append(str(e)[:300])
         return ""
 
 
@@ -718,8 +722,9 @@ Extract evidence from these sources that helps answer the question."""
                 elif len(pages) == 1:
                     url = pages[0]["url"]
                 else:
-                    skipped += 1   # cannot attribute this claim to a source reliably
-                    continue
+                    by_title = next((u for u, t in url_titles.items()
+                                     if t and item.source_title and t.lower() in item.source_title.lower()), None)
+                    url = by_title or pages[0]["url"]
             item.source_url = url
             item.source_title = url_titles[url]
             item.sub_question_id = current_sq_id
@@ -727,6 +732,22 @@ Extract evidence from these sources that helps answer the question."""
             print(f"  [Extract] Found: {item.claim[:70]} (rel={item.relevance}, cred={item.credibility})")
         if skipped:
             print(f"  [Extract] Skipped {skipped} items with no matching source URL")
+
+    if not all_evidence:
+        print("  [Extract] LLM extraction gave nothing; using search snippets as evidence")
+        for page in pages:
+            text = (page.get("snippet") or page.get("content", "")[:400]).strip()
+            if not text:
+                continue
+            all_evidence.append(EvidenceItem(
+                claim=text[:300],
+                source_url=page["url"],
+                source_title=page.get("title", ""),
+                snippet=text[:300],
+                relevance=0.5,
+                credibility=0.5,
+                sub_question_id=current_sq_id,
+            ))
 
     current_sq.status = SubQuestionStatus.DONE  # always mark done to avoid infinite loops
     print(f"  [Extract] Evidence items for {current_sq_id}: {len(all_evidence)}")
